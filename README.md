@@ -14,9 +14,16 @@ I prefer having applications as portable AppImages rather than extracting binari
 
 ## Download
 
-Go to the [Releases](../../releases) page to download the latest JetBrains Toolbox AppImage.
+[![Download JetBrains Toolbox AppImage](https://img.shields.io/badge/Download-JetBrains%20Toolbox%202.8.1-blue?style=for-the-badge&logo=jetbrains)](https://github.com/radioactivepb/jetbrains-appimage/releases/download/v2.8.1/JetBrains-Toolbox-2.8.1-x86_64.AppImage)
 
+**Latest Version:** 2.8.1 | **Size:** 104M
 
+```bash
+# Quick install
+wget "https://github.com/radioactivepb/jetbrains-appimage/releases/download/v2.8.1/JetBrains-Toolbox-2.8.1-x86_64.AppImage" -O JetBrains-Toolbox.AppImage
+chmod +x JetBrains-Toolbox.AppImage
+./JetBrains-Toolbox.AppImage
+```
 ## Quick Start
 
 ```bash
