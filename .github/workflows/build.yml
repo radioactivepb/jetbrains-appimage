@@ -262,16 +262,16 @@ jobs:
         ### Quick Start
         \`\`\`bash
         # Download and make executable
-        chmod +x JetBrains-Toolbox-${VERSION}-x86_64.AppImage
+        chmod +x JetBrains-Toolbox-${VERSION}.AppImage
         
         # Run directly
-        ./JetBrains-Toolbox-${VERSION}-x86_64.AppImage
+        ./JetBrains-Toolbox-${VERSION}.AppImage
         \`\`\`
         
         ### Install to System
         \`\`\`bash
         # Move to local applications
-        mv JetBrains-Toolbox-${VERSION}-x86_64.AppImage ~/.local/bin/jetbrains-toolbox
+        mv JetBrains-Toolbox-${VERSION}.AppImage ~/.local/bin/jetbrains-toolbox
         
         # Run from anywhere
         jetbrains-toolbox
@@ -314,7 +314,7 @@ jobs:
         
         VERSION="${{ steps.get-version.outputs.version }}"
         APPIMAGE_SIZE="${{ steps.build-appimage.outputs.appimage_size }}"
-        DOWNLOAD_URL="https://github.com/${{ github.repository }}/releases/download/v${VERSION}/JetBrains-Toolbox-${VERSION}-x86_64.AppImage"
+        DOWNLOAD_URL="https://github.com/${{ github.repository }}/releases/download/v${VERSION}/JetBrains-Toolbox-${VERSION}.AppImage"
         
         # Update README.md with the new download link
         if [ -f "README.md" ]; then
