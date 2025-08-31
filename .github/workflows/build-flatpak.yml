@@ -1,0 +1,389 @@
+name: Build JetBrains Toolbox Flatpak
+
+on:
+  # Trigger after the AppImage workflow completes
+  workflow_run:
+    workflows: ["Build JetBrains Toolbox AppImage"]
+    types:
+      - completed
+  
+  # Allow manual triggering
+  workflow_dispatch:
+    inputs:
+      appimage_version:
+        description: 'AppImage version to convert (leave empty for latest)'
+        required: false
+        type: string
+
+env:
+  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  FLATPAK_APP_ID: "com.jetbrains.Toolbox"
+
+jobs:
+  build-flatpak:
+    runs-on: ubuntu-latest
+    # Only run if the AppImage workflow was successful
+    if: ${{ github.event.workflow_run.conclusion == 'success' || github.event_name == 'workflow_dispatch' }}
+    permissions:
+      contents: write
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+    
+    - name: Install Flatpak dependencies
+      run: |
+        sudo apt update
+        sudo apt install -y flatpak flatpak-builder curl jq
+        
+        # Debug: Check versions that might affect validation
+        echo "📋 System information:"
+        echo "Ubuntu version: $(lsb_release -d)"
+        echo "Flatpak version: $(flatpak --version)"
+        echo "flatpak-builder version: $(flatpak-builder --version)"
+        echo "appstreamcli version: $(appstreamcli --version 2>/dev/null || echo 'not installed')"
+        
+        # Install appstream tools explicitly
+        sudo apt install -y appstream
+        echo "appstreamcli version after install: $(appstreamcli --version)"
+        
+        # Add Flathub repository for Flatpak dependencies (system-wide)
+        sudo flatpak remote-add --if-not-exists flathub https://flathub.org/repo/flathub.flatpakrepo
+        
+        # Also add for user (in case system install fails)
+        flatpak --user remote-add --if-not-exists flathub https://flathub.org/repo/flathub.flatpakrepo || true
+        
+        # Install required runtimes for Flatpak (try system first, fallback to user)
+        sudo flatpak install -y --noninteractive flathub org.freedesktop.Platform//24.08 org.freedesktop.Sdk//24.08 || \
+        flatpak --user install -y --noninteractive flathub org.freedesktop.Platform//24.08 org.freedesktop.Sdk//24.08
+    
+    - name: Get latest AppImage release
+      id: get-appimage
+      run: |
+        echo "🔍 Finding latest AppImage release..."
+        
+        if [ -n "${{ github.event.inputs.appimage_version }}" ]; then
+          VERSION="${{ github.event.inputs.appimage_version }}"
+          echo "Using manually specified version: $VERSION"
+          RELEASE_TAG="v$VERSION"
+        else
+          # Get the latest release
+          RELEASE_INFO=$(gh release list --limit 1 --json tagName,name,publishedAt)
+          RELEASE_TAG=$(echo "$RELEASE_INFO" | jq -r '.[0].tagName')
+          VERSION=$(echo "$RELEASE_TAG" | sed 's/^v//')
+          echo "Using latest release: $RELEASE_TAG (version: $VERSION)"
+        fi
+        
+        echo "version=$VERSION" >> $GITHUB_OUTPUT
+        echo "release_tag=$RELEASE_TAG" >> $GITHUB_OUTPUT
+        
+        # Find the AppImage file in the release
+        APPIMAGE_NAME="JetBrains-Toolbox-${VERSION}-x86_64.AppImage"
+        echo "appimage_name=$APPIMAGE_NAME" >> $GITHUB_OUTPUT
+        
+        echo "📦 Target AppImage: $APPIMAGE_NAME"
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    
+    - name: Check if Flatpak already exists for this version
+      id: check-flatpak
+      run: |
+        VERSION="${{ steps.get-appimage.outputs.version }}"
+        RELEASE_TAG="${{ steps.get-appimage.outputs.release_tag }}"
+        
+        echo "🔍 Checking if Flatpak already exists for $RELEASE_TAG..."
+        
+        # Check if the Flatpak file already exists in the release
+        FLATPAK_NAME="${FLATPAK_APP_ID}-${VERSION}.flatpak"
+        
+        if gh release view "$RELEASE_TAG" --json assets --jq '.assets[].name' | grep -q "$FLATPAK_NAME"; then
+          echo "✅ Flatpak already exists in release $RELEASE_TAG"
+          echo "exists=true" >> $GITHUB_OUTPUT
+        else
+          echo "🚀 Flatpak not found in release $RELEASE_TAG - will create"
+          echo "exists=false" >> $GITHUB_OUTPUT
+        fi
+        
+        echo "flatpak_name=$FLATPAK_NAME" >> $GITHUB_OUTPUT
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    
+    - name: Download AppImage
+      id: download-appimage
+      if: steps.check-flatpak.outputs.exists == 'false'
+      run: |
+        VERSION="${{ steps.get-appimage.outputs.version }}"
+        RELEASE_TAG="${{ steps.get-appimage.outputs.release_tag }}"
+        APPIMAGE_NAME="${{ steps.get-appimage.outputs.appimage_name }}"
+        
+        echo "📥 Downloading AppImage: $APPIMAGE_NAME from $RELEASE_TAG"
+        
+        # Download the AppImage from the release
+        gh release download "$RELEASE_TAG" --pattern "$APPIMAGE_NAME"
+        
+        # Verify download
+        if [ ! -f "$APPIMAGE_NAME" ]; then
+          echo "❌ Failed to download $APPIMAGE_NAME"
+          exit 1
+        fi
+        
+        chmod +x "$APPIMAGE_NAME"
+        echo "✅ Downloaded: $APPIMAGE_NAME ($(du -h "$APPIMAGE_NAME" | cut -f1))"
+        
+        echo "appimage_file=$PWD/$APPIMAGE_NAME" >> $GITHUB_OUTPUT
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    
+    - name: Extract AppImage and prepare Flatpak sources
+      id: prepare-flatpak
+      if: steps.check-flatpak.outputs.exists == 'false'
+      run: |
+        VERSION="${{ steps.get-appimage.outputs.version }}"
+        APPIMAGE_FILE="${{ steps.download-appimage.outputs.appimage_file }}"
+        
+        echo "📦 Extracting AppImage and preparing Flatpak sources..."
+        
+        # Extract AppImage
+        "$APPIMAGE_FILE" --appimage-extract
+        
+        # Verify extraction
+        if [ ! -d "squashfs-root" ]; then
+          echo "❌ Failed to extract AppImage"
+          exit 1
+        fi
+        
+        echo "📁 AppImage contents:"
+        ls -la squashfs-root/
+        
+        # Create Flatpak sources directory
+        mkdir -p flatpak-sources
+        
+        # Copy the entire usr directory from AppImage
+        cp -r squashfs-root/usr flatpak-sources/
+        
+        # Copy main binary for easy access
+        cp squashfs-root/usr/bin/jetbrains-toolbox flatpak-sources/jetbrains-toolbox
+        chmod +x flatpak-sources/jetbrains-toolbox
+        
+        # Create proper desktop file for Flatpak
+        cat > flatpak-sources/${FLATPAK_APP_ID}.desktop << 'DESKTOP_EOF'
+        [Desktop Entry]
+        Name=JetBrains Toolbox
+        Comment=Essential tools for software developers and teams
+        Exec=jetbrains-toolbox-wrapper
+        Icon=com.jetbrains.Toolbox
+        Type=Application
+        Categories=Development;IDE;
+        StartupWMClass=jetbrains-toolbox
+        MimeType=x-scheme-handler/jetbrains;
+        DESKTOP_EOF
+        
+        # Copy icon (keep original name from AppImage)
+        cp squashfs-root/jetbrains-toolbox.svg flatpak-sources/jetbrains-toolbox.svg
+        
+        echo "✅ Flatpak sources prepared"
+        
+        # Set output for source directory
+        echo "source_dir=$PWD/flatpak-sources" >> $GITHUB_OUTPUT
+    
+    - name: Create Flatpak manifest
+      if: steps.check-flatpak.outputs.exists == 'false'
+      run: |
+        echo "📝 Creating Flatpak manifest..."
+        
+        # Create the Flatpak manifest
+        cat > ${FLATPAK_APP_ID}.json << 'MANIFEST_EOF'
+        {
+            "app-id": "com.jetbrains.Toolbox",
+            "runtime": "org.freedesktop.Platform",
+            "runtime-version": "24.08",
+            "sdk": "org.freedesktop.Sdk",
+            "command": "jetbrains-toolbox-wrapper",
+            "separate-locales": false,
+            "finish-args": [
+                "--share=network",
+                "--share=ipc", 
+                "--socket=x11",
+                "--socket=wayland",
+                "--device=dri",
+                "--filesystem=home",
+                "--filesystem=xdg-run/app/com.discordapp.Discord:create",
+                "--talk-name=org.freedesktop.Notifications",
+                "--talk-name=org.freedesktop.secrets",
+                "--system-talk-name=org.freedesktop.NetworkManager",
+                "--env=TMPDIR=/var/tmp"
+            ],
+            "modules": [
+                {
+                    "name": "jetbrains-toolbox",
+                    "buildsystem": "simple",
+                    "build-commands": [
+                        "# Copy all usr contents to /app",
+                        "cp -r usr/* /app/",
+                        
+                        "# Create wrapper script",
+                        "echo '#!/bin/bash' > /app/bin/jetbrains-toolbox-wrapper",
+                        "echo 'HERE=\"/app\"' >> /app/bin/jetbrains-toolbox-wrapper",
+                        "echo '' >> /app/bin/jetbrains-toolbox-wrapper",
+                        "echo '# Set up environment for JetBrains Toolbox' >> /app/bin/jetbrains-toolbox-wrapper",
+                        "echo 'export PATH=\"${HERE}/bin:${PATH}\"' >> /app/bin/jetbrains-toolbox-wrapper",
+                        "echo 'export LD_LIBRARY_PATH=\"${HERE}/bin:${HERE}/lib:${LD_LIBRARY_PATH}\"' >> /app/bin/jetbrains-toolbox-wrapper",
+                        "echo '' >> /app/bin/jetbrains-toolbox-wrapper",
+                        "echo '# Set JAVA_HOME to the bundled JRE' >> /app/bin/jetbrains-toolbox-wrapper",
+                        "echo 'export JAVA_HOME=\"${HERE}/bin/jre\"' >> /app/bin/jetbrains-toolbox-wrapper",
+                        "echo 'export PATH=\"${JAVA_HOME}/bin:${PATH}\"' >> /app/bin/jetbrains-toolbox-wrapper",
+                        "echo '' >> /app/bin/jetbrains-toolbox-wrapper",
+                        "echo '# Run from the bin directory where all the libraries are' >> /app/bin/jetbrains-toolbox-wrapper",
+                        "echo 'cd \"${HERE}/bin\"' >> /app/bin/jetbrains-toolbox-wrapper",
+                        "echo 'exec ./jetbrains-toolbox \"$@\"' >> /app/bin/jetbrains-toolbox-wrapper",
+                        
+                        "# Make wrapper executable",
+                        "chmod +x /app/bin/jetbrains-toolbox-wrapper",
+                        
+                        "# Install desktop file",
+                        "install -Dm644 com.jetbrains.Toolbox.desktop /app/share/applications/com.jetbrains.Toolbox.desktop",
+                        
+                        "# Install icon in multiple sizes/formats for better compatibility",
+                        "install -Dm644 jetbrains-toolbox.svg /app/share/icons/hicolor/scalable/apps/com.jetbrains.Toolbox.svg",
+                        "# Also install as PNG if SVG conversion is needed",
+                        "mkdir -p /app/share/icons/hicolor/256x256/apps",
+                        "cp jetbrains-toolbox.svg /app/share/icons/hicolor/256x256/apps/com.jetbrains.Toolbox.svg",
+                        
+                        "# Create proper metainfo file with echo commands",
+                        "mkdir -p /app/share/metainfo",
+                        "echo '<?xml version=\"1.0\" encoding=\"UTF-8\"?>' > /app/share/metainfo/com.jetbrains.Toolbox.metainfo.xml",
+                        "echo '<component type=\"desktop-application\">' >> /app/share/metainfo/com.jetbrains.Toolbox.metainfo.xml",
+                        "echo '  <id>com.jetbrains.Toolbox</id>' >> /app/share/metainfo/com.jetbrains.Toolbox.metainfo.xml",
+                        "echo '  <metadata_license>CC0-1.0</metadata_license>' >> /app/share/metainfo/com.jetbrains.Toolbox.metainfo.xml",
+                        "echo '  <project_license>LicenseRef-proprietary</project_license>' >> /app/share/metainfo/com.jetbrains.Toolbox.metainfo.xml",
+                        "echo '  <n>JetBrains Toolbox</n>' >> /app/share/metainfo/com.jetbrains.Toolbox.metainfo.xml",
+                        "echo '  <summary>Essential tools for software developers and teams</summary>' >> /app/share/metainfo/com.jetbrains.Toolbox.metainfo.xml",
+                        "echo '  <description>' >> /app/share/metainfo/com.jetbrains.Toolbox.metainfo.xml",
+                        "echo '    <p>JetBrains Toolbox is a control panel that allows you to manage all JetBrains developer tools from a single interface. Install and update your IDEs, manage projects, and quickly switch between different versions.</p>' >> /app/share/metainfo/com.jetbrains.Toolbox.metainfo.xml",
+                        "echo '  </description>' >> /app/share/metainfo/com.jetbrains.Toolbox.metainfo.xml",
+                        "echo '  <launchable type=\"desktop-id\">com.jetbrains.Toolbox.desktop</launchable>' >> /app/share/metainfo/com.jetbrains.Toolbox.metainfo.xml",
+                        "echo '  <provides>' >> /app/share/metainfo/com.jetbrains.Toolbox.metainfo.xml",
+                        "echo '    <binary>jetbrains-toolbox-wrapper</binary>' >> /app/share/metainfo/com.jetbrains.Toolbox.metainfo.xml",
+                        "echo '  </provides>' >> /app/share/metainfo/com.jetbrains.Toolbox.metainfo.xml",
+                        "echo '  <categories>' >> /app/share/metainfo/com.jetbrains.Toolbox.metainfo.xml",
+                        "echo '    <category>Development</category>' >> /app/share/metainfo/com.jetbrains.Toolbox.metainfo.xml",
+                        "echo '  </categories>' >> /app/share/metainfo/com.jetbrains.Toolbox.metainfo.xml",
+                        "echo '  <url type=\"homepage\">https://www.jetbrains.com/toolbox-app/</url>' >> /app/share/metainfo/com.jetbrains.Toolbox.metainfo.xml",
+                        "echo '  <content_rating type=\"oars-1.1\"/>' >> /app/share/metainfo/com.jetbrains.Toolbox.metainfo.xml",
+                        "echo '</component>' >> /app/share/metainfo/com.jetbrains.Toolbox.metainfo.xml"
+                    ],
+                    "sources": [
+                        {
+                            "type": "dir",
+                            "path": "flatpak-sources"
+                        }
+                    ]
+                }
+            ]
+        }
+        MANIFEST_EOF
+        
+        echo "✅ Manifest created"
+    
+    - name: Build Flatpak
+      id: build-flatpak
+      if: steps.check-flatpak.outputs.exists == 'false'
+      run: |
+        VERSION="${{ steps.get-appimage.outputs.version }}"
+        
+        echo "🔨 Building Flatpak..."
+        
+        # Build the Flatpak (with validation to see specific errors)
+        flatpak-builder \
+          --force-clean \
+          --user \
+          --install-deps-from=flathub \
+          --repo=repo \
+          --subject="JetBrains Toolbox ${VERSION} (from AppImage)" \
+          build-dir \
+          ${FLATPAK_APP_ID}.json
+        
+        echo "📦 Creating Flatpak bundle..."
+        
+        # Create a single-file bundle for distribution
+        FLATPAK_FILE="${FLATPAK_APP_ID}-${VERSION}.flatpak"
+        flatpak build-bundle \
+          repo \
+          "$FLATPAK_FILE" \
+          ${FLATPAK_APP_ID}
+        
+        # Get bundle size
+        FLATPAK_SIZE=$(du -h "$FLATPAK_FILE" | cut -f1)
+        echo "flatpak_size=$FLATPAK_SIZE" >> $GITHUB_OUTPUT
+        echo "flatpak_file=$PWD/$FLATPAK_FILE" >> $GITHUB_OUTPUT
+        
+        echo "✅ Flatpak built successfully!"
+        echo "📦 File: $FLATPAK_FILE"
+        echo "📏 Size: $FLATPAK_SIZE"
+    
+    - name: Upload Flatpak to existing release
+      if: steps.check-flatpak.outputs.exists == 'false'
+      run: |
+        VERSION="${{ steps.get-appimage.outputs.version }}"
+        RELEASE_TAG="${{ steps.get-appimage.outputs.release_tag }}"
+        FLATPAK_FILE="${{ steps.build-flatpak.outputs.flatpak_file }}"
+        FLATPAK_SIZE="${{ steps.build-flatpak.outputs.flatpak_size }}"
+        
+        echo "📤 Uploading Flatpak to existing release $RELEASE_TAG..."
+        
+        # Upload the Flatpak to the existing release
+        gh release upload "$RELEASE_TAG" "$FLATPAK_FILE"
+        
+        # Update the release notes to include Flatpak information
+        CURRENT_NOTES=$(gh release view "$RELEASE_TAG" --json body --jq '.body')
+        
+        # Add Flatpak section to release notes if not already present
+        if ! echo "$CURRENT_NOTES" | grep -q "Flatpak"; then
+          cat > flatpak_addition.md << EOF
+        
+        ### 🥪 Flatpak (Sandboxed)
+        - **Size:** ${FLATPAK_SIZE}
+        - **Format:** Sandboxed application with proper system integration
+        - **Installation:** \`flatpak install --bundle $(basename "$FLATPAK_FILE")\`
+        
+        #### Flatpak Installation
+        \`\`\`bash
+        # Install from bundle
+        flatpak install --user --bundle $(basename "$FLATPAK_FILE")
+        
+        # Run
+        flatpak run com.jetbrains.Toolbox
+        \`\`\`
+        EOF
+          
+          # Append to existing notes
+          echo "$CURRENT_NOTES" > temp_notes.md
+          cat flatpak_addition.md >> temp_notes.md
+          
+          # Update release
+          gh release edit "$RELEASE_TAG" --notes-file temp_notes.md
+          
+          rm flatpak_addition.md temp_notes.md
+        fi
+        
+        echo "✅ Flatpak uploaded to release $RELEASE_TAG"
+        echo "📍 Release URL: https://github.com/${{ github.repository }}/releases/tag/$RELEASE_TAG"
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Success notification
+      if: steps.check-flatpak.outputs.exists == 'false' && success()
+      run: |
+        echo "🎉 SUCCESS! Flatpak created and added to release!"
+        echo ""
+        echo "📦 Release: https://github.com/${{ github.repository }}/releases/tag/${{ steps.get-appimage.outputs.release_tag }}"
+        echo "🥪 Flatpak Size: ${{ steps.build-flatpak.outputs.flatpak_size }}"
+        echo "📱 AppImage: ${{ steps.get-appimage.outputs.appimage_name }}"
+        echo ""
+        echo "Users can now choose between AppImage (portable) or Flatpak (sandboxed)!"
+    
+    - name: Already exists notification
+      if: steps.check-flatpak.outputs.exists == 'true'
+      run: |
+        echo "ℹ️  Flatpak already exists for release ${{ steps.get-appimage.outputs.release_tag }}"
+        echo "📦 File: ${{ steps.check-flatpak.outputs.flatpak_name }}"

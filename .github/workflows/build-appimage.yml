@@ -1,0 +1,303 @@
+name: Build JetBrains Toolbox AppImage
+
+on:
+  # Run every 24 hours
+  schedule:
+    - cron: '0 */24 * * *'
+  
+  # Allow manual triggering
+  workflow_dispatch:
+  
+  # Trigger on push to main for testing
+  push:
+    branches: [ main ]
+    paths: 
+      - '.github/workflows/build-appimage.yml'
+      - '.github/workflows/build-flatpak.yml'
+
+env:
+  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+jobs:
+  check-and-build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+    
+    - name: Install dependencies
+      run: |
+        sudo apt update
+        sudo apt install -y curl jq file
+    
+    - name: Get latest JetBrains Toolbox version
+      id: get-version
+      run: |
+        echo "🔍 Checking JetBrains API for latest version..."
+        
+        # Get latest release info from JetBrains API
+        RELEASE_INFO=$(curl -s 'https://data.services.jetbrains.com/products/releases?code=TBA&latest=true&type=release')
+        VERSION=$(echo "$RELEASE_INFO" | jq -r '.TBA[0].version')
+        BUILD=$(echo "$RELEASE_INFO" | jq -r '.TBA[0].build')
+        DOWNLOAD_URL=$(echo "$RELEASE_INFO" | jq -r '.TBA[0].downloads.linux.link')
+        RELEASE_DATE=$(echo "$RELEASE_INFO" | jq -r '.TBA[0].date')
+        
+        echo "Latest version: $VERSION"
+        echo "Build: $BUILD" 
+        echo "Release date: $RELEASE_DATE"
+        echo "Download URL: $DOWNLOAD_URL"
+        
+        # Set outputs
+        echo "version=$VERSION" >> $GITHUB_OUTPUT
+        echo "build=$BUILD" >> $GITHUB_OUTPUT
+        echo "download_url=$DOWNLOAD_URL" >> $GITHUB_OUTPUT
+        echo "release_date=$RELEASE_DATE" >> $GITHUB_OUTPUT
+    
+    - name: Check if release already exists
+      id: check-release
+      run: |
+        echo "🔍 Checking if release v${{ steps.get-version.outputs.version }} already exists..."
+        
+        # Check if GitHub release already exists for this version
+        if gh release view "v${{ steps.get-version.outputs.version }}" > /dev/null 2>&1; then
+          echo "Release v${{ steps.get-version.outputs.version }} already exists"
+          echo "exists=true" >> $GITHUB_OUTPUT
+        else
+          echo "Release v${{ steps.get-version.outputs.version }} does not exist - will create"
+          echo "exists=false" >> $GITHUB_OUTPUT
+        fi
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    
+    - name: Build AppImage
+      id: build-appimage
+      if: steps.check-release.outputs.exists == 'false'
+      run: |
+        echo "🚀 Building AppImage for version ${{ steps.get-version.outputs.version }}..."
+        
+        # Inline AppImage builder script
+        set -e
+        
+        # Configuration
+        APP_NAME="JetBrains-Toolbox"
+        WORK_DIR="/tmp/jetbrains-toolbox-appimage"
+        BUILD_DIR="${WORK_DIR}/build"
+        APP_DIR="${WORK_DIR}/AppDir"
+        
+        echo "🚀 Building JetBrains Toolbox AppImage..."
+        
+        # Clean and create directories
+        rm -rf "${WORK_DIR}"
+        mkdir -p "${BUILD_DIR}" "${APP_DIR}"/{usr/bin,usr/share/{applications,icons/hicolor/scalable/apps}}
+        
+        cd "${BUILD_DIR}"
+        
+        # Get latest Toolbox download URL
+        echo "📡 Getting latest Toolbox version..."
+        ARCHIVE_URL="${{ steps.get-version.outputs.download_url }}"
+        VERSION="${{ steps.get-version.outputs.version }}"
+        
+        echo "📥 Downloading Toolbox $VERSION..."
+        curl -Lo "toolbox.tar.gz" "$ARCHIVE_URL"
+        
+        # Extract binary and examine contents
+        echo "📦 Extracting and examining contents..."
+        TMP_EXTRACT=$(mktemp -d)
+        tar -xzf "toolbox.tar.gz" --strip-components=1 -C "$TMP_EXTRACT"
+        
+        echo "📁 Contents of extracted archive:"
+        ls -la "$TMP_EXTRACT"
+        echo ""
+        echo "🔍 Files in bin directory:"
+        ls -la "$TMP_EXTRACT/bin/" 2>/dev/null || echo "No bin directory"
+        echo ""
+        
+        # Copy everything, not just the binary
+        echo "📦 Copying all files to AppDir..."
+        cp -r "$TMP_EXTRACT"/* "${APP_DIR}/usr/" 2>/dev/null || true
+        
+        # Ensure the binary is executable and in the right place
+        if [ -f "$TMP_EXTRACT/bin/jetbrains-toolbox" ]; then
+            cp "$TMP_EXTRACT/bin/jetbrains-toolbox" "${APP_DIR}/usr/bin/"
+            chmod +x "${APP_DIR}/usr/bin/jetbrains-toolbox"
+        elif [ -f "$TMP_EXTRACT/jetbrains-toolbox" ]; then
+            cp "$TMP_EXTRACT/jetbrains-toolbox" "${APP_DIR}/usr/bin/"
+            chmod +x "${APP_DIR}/usr/bin/jetbrains-toolbox"
+        fi
+        
+        # Create AppRun that sets up the proper environment
+        cat > "${APP_DIR}/AppRun" << 'APPRUN_EOF'
+        #!/bin/bash
+        HERE="$(dirname "$(readlink -f "${0}")")"
+        
+        # Set up environment for JetBrains Toolbox
+        export PATH="${HERE}/usr/bin:${PATH}"
+        export LD_LIBRARY_PATH="${HERE}/usr/bin:${HERE}/usr/lib:${LD_LIBRARY_PATH}"
+        
+        # Set JAVA_HOME to the bundled JRE
+        export JAVA_HOME="${HERE}/usr/bin/jre"
+        export PATH="${JAVA_HOME}/bin:${PATH}"
+        
+        # Create desktop integration
+        mkdir -p "${HOME}/.local/share/applications"
+        if [ ! -f "${HOME}/.local/share/applications/jetbrains-toolbox.desktop" ]; then
+            cat > "${HOME}/.local/share/applications/jetbrains-toolbox.desktop" << DESKTOP_EOF
+        [Desktop Entry]
+        Name=JetBrains Toolbox
+        Exec=${0}
+        Icon=jetbrains-toolbox
+        Type=Application
+        Categories=Development;
+        DESKTOP_EOF
+        fi
+        
+        # Run from the bin directory where all the libraries are
+        cd "${HERE}/usr/bin"
+        exec ./jetbrains-toolbox "$@"
+        APPRUN_EOF
+        chmod +x "${APP_DIR}/AppRun"
+        
+        # Create desktop file with proper version info
+        cat > "${APP_DIR}/jetbrains-toolbox.desktop" << DESKTOP_EOF
+        [Desktop Entry]
+        Name=JetBrains Toolbox
+        Exec=jetbrains-toolbox
+        Icon=jetbrains-toolbox
+        Type=Application
+        Categories=Development;
+        X-AppImage-Version=${VERSION}
+        DESKTOP_EOF
+        cp "${APP_DIR}/jetbrains-toolbox.desktop" "${APP_DIR}/usr/share/applications/"
+        
+        # Create JetBrains Toolbox icon
+        cat > "${APP_DIR}/jetbrains-toolbox.svg" << 'SVG_EOF'
+        <svg xmlns="http://www.w3.org/2000/svg"  viewBox="0 0 48 48" width="48px" height="48px" baseProfile="basic"><polygon fill="#212121" points="24,23 24,44 42,34.5 42,13.5"/><polygon fill="#fafafa" points="35.016,30.297 28,34 28,37 35.016,33.297"/><polygon fill="#f44336" points="6,13.5 6,16.5 24,26 24,23"/><polygon fill="#ff5722" points="6,16.5 6,19.5 24,29 24,26"/><polygon fill="#ff6f00" points="6,19.5 6,22.5 24,32 24,29"/><polygon fill="#ff8f00" points="6,22.5 6,25.5 24,35 24,32"/><polygon fill="#ff9800" points="6,25.5 6,28.5 24,38 24,35"/><polygon fill="#ffb300" points="6,28.5 6,31.5 24,41 24,38"/><polygon fill="#fbc02d" points="6,31.5 6,34.5 24,44 24,41"/><polygon fill="#ff1744" points="8.565,12.146 6,13.5 24,23 26.565,21.646"/><polygon fill="#f50057" points="11.13,10.793 8.565,12.146 26.565,21.646 29.13,20.293"/><polygon fill="#e91e63" points="13.694,9.439 11.13,10.793 29.13,20.293 31.694,18.939"/><polygon fill="#d81b60" points="16.259,8.085 13.694,9.439 31.694,18.939 34.259,17.586"/><polygon fill="#c51162" points="18.824,6.732 16.259,8.085 34.259,17.586 36.824,16.232"/><polygon fill="#ad1457" points="21.389,5.378 18.824,6.732 36.824,16.232 39.389,14.878"/><polygon fill="#8e24aa" points="24,4 21.389,5.378 39.389,14.878 42,13.5"/></svg>
+        SVG_EOF
+        cp "${APP_DIR}/jetbrains-toolbox.svg" "${APP_DIR}/usr/share/icons/hicolor/scalable/apps/"
+        echo "jetbrains-toolbox.svg" > "${APP_DIR}/.DirIcon"
+        
+        # Create AppImage info file for proper version detection
+        cat > "${APP_DIR}/.appimage-info" << INFO_EOF
+        {
+          "name": "JetBrains Toolbox",
+          "version": "${VERSION}",
+          "build": "${BUILD}",
+          "arch": "x86_64"
+        }
+        INFO_EOF
+        
+        # Create update information file that GearLever can read
+        echo "gh-releases-zsync|radioactivepb|jetbrains-appimage|latest|JetBrains-Toolbox-*-x86_64.AppImage.zsync" > "${APP_DIR}/update-info"
+        
+        # Download and build AppImage
+        echo "📥 Downloading AppImageTool..."
+        curl -L "https://github.com/AppImage/AppImageKit/releases/download/continuous/appimagetool-x86_64.AppImage" -o appimagetool
+        chmod +x appimagetool
+        
+        echo "🔨 Building AppImage..."
+        # GitHub Actions doesn't have FUSE, so extract and run appimagetool directly
+        ./appimagetool --appimage-extract >/dev/null 2>&1 || true
+        
+        # Use the extracted appimagetool
+        if [ -d "squashfs-root" ]; then
+            echo "Using extracted AppImageTool..."
+            ARCH=x86_64 ./squashfs-root/AppRun "${APP_DIR}" "${APP_NAME}-${VERSION}-x86_64.AppImage"
+        else
+            echo "Extraction failed, trying direct method..."
+            # Fallback: try to run it anyway (sometimes works)
+            ARCH=x86_64 ./appimagetool "${APP_DIR}" "${APP_NAME}-${VERSION}-x86_64.AppImage" || {
+                echo "AppImageTool failed, creating manual AppImage..."
+                # Manual AppImage creation as last resort
+                cd "${APP_DIR}"
+                mksquashfs . "../${APP_NAME}-${VERSION}-x86_64.AppImage" -root-owned -noappend
+                cd ..
+                chmod +x "${APP_NAME}-${VERSION}-x86_64.AppImage"
+            }
+        fi
+        
+        # Move to workspace
+        cp "${APP_NAME}-${VERSION}-x86_64.AppImage" "${{ github.workspace }}/"
+        chmod +x "${{ github.workspace }}/${APP_NAME}-${VERSION}-x86_64.AppImage"
+        
+        echo "✅ Done! Created: ${APP_NAME}-${VERSION}-x86_64.AppImage"
+        
+        # Set outputs for next step
+        echo "appimage_file=${{ github.workspace }}/${APP_NAME}-${VERSION}-x86_64.AppImage" >> $GITHUB_OUTPUT
+        
+        # Get file size for release notes
+        APPIMAGE_SIZE=$(du -h "${{ github.workspace }}/${APP_NAME}-${VERSION}-x86_64.AppImage" | cut -f1)
+        echo "📏 AppImage size: $APPIMAGE_SIZE"
+        echo "appimage_size=$APPIMAGE_SIZE" >> $GITHUB_OUTPUT
+        
+        # Cleanup
+        rm -rf "${WORK_DIR}" "$TMP_EXTRACT"
+    
+    - name: Create GitHub Release
+      if: steps.check-release.outputs.exists == 'false'
+      run: |
+        echo "📦 Creating GitHub release v${{ steps.get-version.outputs.version }}..."
+        
+        APPIMAGE_FILE="${{ steps.build-appimage.outputs.appimage_file }}"
+        VERSION="${{ steps.get-version.outputs.version }}"
+        BUILD="${{ steps.get-version.outputs.build }}"
+        RELEASE_DATE="${{ steps.get-version.outputs.release_date }}"
+        APPIMAGE_SIZE="${{ steps.build-appimage.outputs.appimage_size }}"
+        
+        # Create release notes
+        cat > release_notes.md << EOF
+        # JetBrains Toolbox v${VERSION}
+        
+        🚀 **Automated build of JetBrains Toolbox Portable Packages**
+        
+        ## Release Information
+        - **Version:** ${VERSION}
+        - **Build:** ${BUILD}
+        - **Release Date:** ${RELEASE_DATE}
+        
+        ## Features
+        - ✅ Complete JetBrains Toolbox with bundled Java runtime
+        - ✅ All dependencies included - works on any Linux distro
+        - ✅ Automatic desktop integration
+        - ✅ Portable - no installation required
+        - ✅ Self-contained - doesn't interfere with system
+        
+        ## What's Included
+        - JetBrains Toolbox ${VERSION}
+        - Bundled OpenJDK runtime
+        - All required libraries and dependencies
+        - Desktop integration files
+        
+        ---
+        
+        EOF
+        
+        # Create the release
+        gh release create "v${VERSION}" \
+          --title "JetBrains Toolbox Portable Packages v${VERSION}" \
+          --notes-file release_notes.md \
+          --latest \
+          "$APPIMAGE_FILE"
+        
+        echo "✅ Release created successfully!"
+        echo "📍 Release URL: https://github.com/${{ github.repository }}/releases/tag/v${VERSION}"
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    
+    - name: Success notification
+      if: steps.check-release.outputs.exists == 'false' && success()
+      run: |
+        echo "🎉 SUCCESS! New JetBrains Toolbox AppImage v${{ steps.get-version.outputs.version }} has been built and released!"
+        echo ""
+        echo "📦 Download: https://github.com/${{ github.repository }}/releases/latest"
+        echo "📏 Size: ${{ steps.build-appimage.outputs.appimage_size }}"
+        echo ""
+        echo "🔄 Next check in 12 hours..."
+    
+    - name: No update needed
+      if: steps.check-release.outputs.exists == 'true'
+      run: |
+        echo "ℹ️  No update needed - release v${{ steps.get-version.outputs.version }} already exists"
+        echo "🔄 Next check in 12 hours..."
